@@ -1,0 +1,621 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Comprehensive security monitoring and alerting stack'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Description: Name of the project
+    Default: security-monitoring
+  
+  NotificationEmail:
+    Type: String
+    Description: Email address for security notifications
+    Default: security@example.com
+  
+  SlackWebhookUrl:
+    Type: String
+    Description: Slack webhook URL for notifications
+    Default: ''
+    NoEcho: true
+
+Resources:
+  # CloudTrail for API logging
+  SecurityCloudTrail:
+    Type: AWS::CloudTrail::Trail
+    Properties:
+      TrailName: !Sub '${ProjectName}-security-trail'
+      S3BucketName: !Ref CloudTrailBucket
+      S3KeyPrefix: cloudtrail-logs/
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: true
+      EnableLogFileValidation: true
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+          DataResources:
+            - Type: 'AWS::S3::Object'
+              Values: 
+                - 'arn:aws:s3:::sensitive-data-bucket/*'
+            - Type: 'AWS::S3::Bucket'
+              Values: 
+                - '*'
+      InsightSelectors:
+        - InsightType: ApiCallRateInsight
+
+  # S3 Bucket for CloudTrail logs
+  CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-cloudtrail-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref CloudTrailKMSKey
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: CloudTrailLogRetention
+            Status: Enabled
+            ExpirationInDays: 2555  # 7 years
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+              - TransitionInDays: 365
+                StorageClass: DEEP_ARCHIVE
+
+  # KMS Key for CloudTrail encryption
+  CloudTrailKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS Key for CloudTrail log encryption
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow CloudTrail to encrypt logs
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action:
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+          - Sid: Allow CloudTrail to describe key
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: kms:DescribeKey
+            Resource: '*'
+
+  # CloudTrail KMS Key Alias
+  CloudTrailKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-cloudtrail-key'
+      TargetKeyId: !Ref CloudTrailKMSKey
+
+  # CloudTrail Bucket Policy
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt CloudTrailBucket.Arn
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${CloudTrailBucket.Arn}/cloudtrail-logs/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+
+  # GuardDuty Detector
+  GuardDutyDetector:
+    Type: AWS::GuardDuty::Detector
+    Properties:
+      Enable: true
+      FindingPublishingFrequency: FIFTEEN_MINUTES
+      DataSources:
+        S3Logs:
+          Enable: true
+        KubernetesConfiguration:
+          AuditLogs:
+            Enable: true
+        MalwareProtection:
+          ScanEc2InstanceWithFindings:
+            EbsVolumes: true
+
+  # Config Configuration Recorder
+  ConfigConfigurationRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Properties:
+      Name: !Sub '${ProjectName}-config-recorder'
+      RoleARN: !GetAtt ConfigRole.Arn
+      RecordingGroup:
+        AllSupported: true
+        IncludeGlobalResourceTypes: true
+        ResourceTypes: []
+
+  # Config Delivery Channel
+  ConfigDeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    Properties:
+      Name: !Sub '${ProjectName}-delivery-channel'
+      S3BucketName: !Ref ConfigBucket
+      S3KeyPrefix: config-logs/
+      ConfigSnapshotDeliveryProperties:
+        DeliveryFrequency: TwentyFour_Hours
+
+  # S3 Bucket for Config
+  ConfigBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-config-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # Config Service Role
+  ConfigRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-config-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/ConfigRole
+      Policies:
+        - PolicyName: ConfigBucketPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketAcl
+                  - s3:ListBucket
+                Resource: !GetAtt ConfigBucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub '${ConfigBucket.Arn}/*'
+
+  # Config Rules
+  EncryptedVolumesRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigConfigurationRecorder
+    Properties:
+      ConfigRuleName: encrypted-volumes
+      Description: Checks whether Amazon EBS volumes are encrypted
+      Source:
+        Owner: AWS
+        SourceIdentifier: ENCRYPTED_VOLUMES
+
+  S3BucketPublicReadRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigConfigurationRecorder
+    Properties:
+      ConfigRuleName: s3-bucket-public-read-prohibited
+      Description: Checks if S3 buckets allow public read access
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_BUCKET_PUBLIC_READ_PROHIBITED
+
+  RootAccessKeyRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigConfigurationRecorder
+    Properties:
+      ConfigRuleName: root-access-key-check
+      Description: Checks whether root access keys are available
+      Source:
+        Owner: AWS
+        SourceIdentifier: ROOT_ACCESS_KEY_CHECK
+
+  IAMPasswordPolicyRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigConfigurationRecorder
+    Properties:
+      ConfigRuleName: iam-password-policy
+      Description: Checks whether the IAM password policy meets specified requirements
+      Source:
+        Owner: AWS
+        SourceIdentifier: IAM_PASSWORD_POLICY
+      InputParameters: |
+        {
+          "RequireUppercaseCharacters": "true",
+          "RequireLowercaseCharacters": "true",
+          "RequireSymbols": "true",
+          "RequireNumbers": "true",
+          "MinimumPasswordLength": "14",
+          "PasswordReusePrevention": "5",
+          "MaxPasswordAge": "90"
+        }
+
+  # Security Hub
+  SecurityHub:
+    Type: AWS::SecurityHub::Hub
+    Properties:
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # EventBridge Rules for Security Events
+  GuardDutyEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-guardduty-findings'
+      Description: Capture GuardDuty findings
+      EventPattern:
+        source:
+          - aws.guardduty
+        detail-type:
+          - GuardDuty Finding
+        detail:
+          severity:
+            - 4.0
+            - 4.1
+            - 4.2
+            - 4.3
+            - 7.0
+            - 7.1
+            - 7.2
+            - 7.3
+            - 8.0
+            - 8.1
+            - 8.2
+            - 8.3
+      Targets:
+        - Arn: !GetAtt SecurityResponseFunction.Arn
+          Id: SecurityResponseTarget
+        - Arn: !Ref SecurityAlertsTopic
+          Id: SNSTarget
+
+  ConfigComplianceEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-config-compliance'
+      Description: Capture Config compliance changes
+      EventPattern:
+        source:
+          - aws.config
+        detail-type:
+          - Config Rules Compliance Change
+        detail:
+          newEvaluationResult:
+            complianceType:
+              - NON_COMPLIANT
+      Targets:
+        - Arn: !GetAtt SecurityResponseFunction.Arn
+          Id: SecurityResponseTarget
+        - Arn: !Ref SecurityAlertsTopic
+          Id: SNSTarget
+
+  # Lambda function for security response
+  SecurityResponseFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-security-response'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt SecurityResponseRole.Arn
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref SecurityAlertsTopic
+          SLACK_WEBHOOK_URL: !Ref SlackWebhookUrl
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import urllib3
+          import os
+          from datetime import datetime
+          
+          def lambda_handler(event, context):
+              print(f"Received event: {json.dumps(event, indent=2)}")
+              
+              # Initialize clients
+              sns_client = boto3.client('sns')
+              ec2_client = boto3.client('ec2')
+              
+              detail = event['detail']
+              source = event['source']
+              
+              if source == 'aws.guardduty':
+                  handle_guardduty_finding(detail, sns_client, ec2_client)
+              elif source == 'aws.config':
+                  handle_config_compliance(detail, sns_client)
+              
+              return {'statusCode': 200}
+          
+          def handle_guardduty_finding(detail, sns_client, ec2_client):
+              finding_type = detail['type']
+              severity = detail['severity']
+              
+              # High severity findings require immediate action
+              if severity >= 7.0:
+                  if 'UnauthorizedAPICallFindingType' in finding_type:
+                      # Isolate affected resource
+                      if 'instanceId' in detail.get('resource', {}).get('instanceDetails', {}):
+                          instance_id = detail['resource']['instanceDetails']['instanceId']
+                          isolate_instance(instance_id, ec2_client)
+                  
+                  # Send high priority alert
+                  message = f"""
+                  🚨 HIGH SEVERITY SECURITY ALERT 🚨
+                  
+                  Finding Type: {finding_type}
+                  Severity: {severity}
+                  Account: {detail['accountId']}
+                  Region: {detail['region']}
+                  Time: {detail['updatedAt']}
+                  
+                  Description: {detail['description']}
+                  """
+                  
+                  sns_client.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Message=message,
+                      Subject='🚨 HIGH SEVERITY SECURITY ALERT'
+                  )
+                  
+                  # Send to Slack if configured
+                  webhook_url = os.environ.get('SLACK_WEBHOOK_URL')
+                  if webhook_url:
+                      send_slack_notification(webhook_url, message)
+          
+          def handle_config_compliance(detail, sns_client):
+              rule_name = detail['configRuleName']
+              compliance_type = detail['newEvaluationResult']['complianceType']
+              resource_type = detail['resourceType']
+              resource_id = detail['resourceId']
+              
+              if compliance_type == 'NON_COMPLIANT':
+                  message = f"""
+                  ⚠️ COMPLIANCE VIOLATION DETECTED ⚠️
+                  
+                  Config Rule: {rule_name}
+                  Resource Type: {resource_type}
+                  Resource ID: {resource_id}
+                  Status: {compliance_type}
+                  Time: {datetime.utcnow().isoformat()}
+                  
+                  Please review and remediate immediately.
+                  """
+                  
+                  sns_client.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Message=message,
+                      Subject='⚠️ COMPLIANCE VIOLATION DETECTED'
+                  )
+          
+          def isolate_instance(instance_id, ec2_client):
+              try:
+                  # Create isolation security group if it doesn't exist
+                  isolation_sg_id = get_or_create_isolation_sg(ec2_client)
+                  
+                  # Apply isolation security group
+                  ec2_client.modify_instance_attribute(
+                      InstanceId=instance_id,
+                      Groups=[isolation_sg_id]
+                  )
+                  
+                  # Tag the instance
+                  ec2_client.create_tags(
+                      Resources=[instance_id],
+                      Tags=[
+                          {'Key': 'SecurityStatus', 'Value': 'Isolated'},
+                          {'Key': 'IsolationTime', 'Value': datetime.utcnow().isoformat()}
+                      ]
+                  )
+                  
+                  print(f"Instance {instance_id} isolated successfully")
+              except Exception as e:
+                  print(f"Failed to isolate instance {instance_id}: {str(e)}")
+          
+          def get_or_create_isolation_sg(ec2_client):
+              # Try to find existing isolation security group
+              try:
+                  response = ec2_client.describe_security_groups(
+                      Filters=[{'Name': 'group-name', 'Values': ['isolation-sg']}]
+                  )
+                  if response['SecurityGroups']:
+                      return response['SecurityGroups'][0]['GroupId']
+              except:
+                  pass
+              
+              # Create isolation security group
+              vpc_response = ec2_client.describe_vpcs(
+                  Filters=[{'Name': 'is-default', 'Values': ['true']}]
+              )
+              vpc_id = vpc_response['Vpcs'][0]['VpcId']
+              
+              sg_response = ec2_client.create_security_group(
+                  GroupName='isolation-sg',
+                  Description='Security group for isolated instances',
+                  VpcId=vpc_id
+              )
+              
+              return sg_response['GroupId']
+          
+          def send_slack_notification(webhook_url, message):
+              try:
+                  http = urllib3.PoolManager()
+                  data = {'text': message}
+                  response = http.request(
+                      'POST',
+                      webhook_url,
+                      body=json.dumps(data).encode('utf-8'),
+                      headers={'Content-Type': 'application/json'}
+                  )
+                  print(f"Slack notification sent: {response.status}")
+              except Exception as e:
+                  print(f"Failed to send Slack notification: {str(e)}")
+
+  # IAM Role for Security Response Lambda
+  SecurityResponseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-security-response-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SecurityResponsePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SecurityAlertsTopic
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeVpcs
+                  - ec2:CreateSecurityGroup
+                  - ec2:ModifyInstanceAttribute
+                  - ec2:CreateTags
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # Lambda permission for EventBridge
+  SecurityResponseLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SecurityResponseFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt GuardDutyEventRule.Arn
+
+  ConfigComplianceLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SecurityResponseFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ConfigComplianceEventRule.Arn
+
+  # SNS Topic for security alerts
+  SecurityAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-security-alerts'
+      DisplayName: Security Alerts
+      KmsMasterKeyId: alias/aws/sns
+
+  # SNS Subscription for email notifications
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref SecurityAlertsTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # CloudWatch Dashboard for security metrics
+  SecurityDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-security-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Events", "InvocationsCount", "RuleName", "${ProjectName}-guardduty-findings" ],
+                  [ "AWS/Events", "InvocationsCount", "RuleName", "${ProjectName}-config-compliance" ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Security Events"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${ProjectName}-security-response'\n| fields @timestamp, @message\n| sort @timestamp desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Recent Security Response Logs"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  CloudTrailArn:
+    Description: ARN of the CloudTrail
+    Value: !GetAtt SecurityCloudTrail.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudTrailArn'
+
+  GuardDutyDetectorId:
+    Description: ID of the GuardDuty detector
+    Value: !Ref GuardDutyDetector
+    Export:
+      Name: !Sub '${AWS::StackName}-GuardDutyDetectorId'
+
+  SecurityAlertsTopicArn:
+    Description: ARN of the security alerts SNS topic
+    Value: !Ref SecurityAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityAlertsTopicArn'
+
+  SecurityResponseFunctionArn:
+    Description: ARN of the security response Lambda function
+    Value: !GetAtt SecurityResponseFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityResponseFunctionArn'

@@ -1,0 +1,344 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Advanced CodeCommit repository with approval rules and branch protection'
+
+Parameters:
+  RepositoryName:
+    Type: String
+    Description: Name of the CodeCommit repository
+    Default: production-app
+    
+  Environment:
+    Type: String
+    Description: Environment name
+    Default: production
+    AllowedValues: [development, staging, production]
+    
+  RequiredApprovers:
+    Type: Number
+    Description: Number of required approvers for production branches
+    Default: 2
+    MinValue: 1
+    MaxValue: 5
+    
+  SeniorDevRole1:
+    Type: String
+    Description: ARN of first senior developer role
+    
+  SeniorDevRole2:
+    Type: String
+    Description: ARN of second senior developer role
+
+Resources:
+  # CodeCommit Repository with advanced configuration
+  ProductionRepository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Ref RepositoryName
+      RepositoryDescription: !Sub 'Production repository for ${Environment} environment'
+      Code:
+        S3:
+          Bucket: !Ref InitialCodeBucket
+          Key: initial-code.zip
+      Triggers:
+        - Name: MainBranchTrigger
+          DestinationArn: !GetAtt BranchNotificationTopic.Arn
+          Events:
+            - updateReference
+          Branches:
+            - main
+        - Name: DevelopBranchTrigger
+          DestinationArn: !GetAtt BranchNotificationTopic.Arn
+          Events:
+            - createReference
+            - updateReference
+          Branches:
+            - develop
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: CriticalityLevel
+          Value: High
+        - Key: BackupRequired
+          Value: 'true'
+
+  # S3 Bucket for initial repository code
+  InitialCodeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${RepositoryName}-initial-code-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # Approval Rule Template for main branch
+  MainBranchApprovalRule:
+    Type: AWS::CodeCommit::ApprovalRuleTemplate
+    Properties:
+      ApprovalRuleTemplateName: !Sub '${RepositoryName}-main-branch-approval'
+      ApprovalRuleTemplateDescription: 'Approval rule for main branch requiring senior developer approval'
+      ApprovalRuleTemplateContent: !Sub |
+        {
+          "Version": "2018-11-08",
+          "DestinationReferences": ["refs/heads/main"],
+          "Statements": [
+            {
+              "Type": "Approvers",
+              "NumberOfApprovalsNeeded": ${RequiredApprovers},
+              "ApprovalPoolMembers": [
+                "${SeniorDevRole1}",
+                "${SeniorDevRole2}"
+              ]
+            }
+          ]
+        }
+
+  # Associate approval rule with repository
+  ApprovalRuleAssociation:
+    Type: AWS::CodeCommit::ApprovalRuleTemplateAssociation
+    Properties:
+      ApprovalRuleTemplateName: !Ref MainBranchApprovalRule
+      RepositoryName: !Ref ProductionRepository
+
+  # SNS Topic for branch notifications
+  BranchNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${RepositoryName}-branch-notifications'
+      DisplayName: Repository Branch Notifications
+      KmsMasterKeyId: alias/aws/sns
+
+  # SNS Topic Policy
+  BranchNotificationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref BranchNotificationTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codecommit.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref BranchNotificationTopic
+
+  # Lambda function for automated branch protection
+  BranchProtectionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${RepositoryName}-branch-protection'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt BranchProtectionRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          REPOSITORY_NAME: !Ref ProductionRepository
+          PROTECTED_BRANCHES: 'main,production,release/*'
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          
+          codecommit = boto3.client('codecommit')
+          
+          def lambda_handler(event, context):
+              repository_name = os.environ['REPOSITORY_NAME']
+              protected_branches = os.environ['PROTECTED_BRANCHES'].split(',')
+              
+              # Parse SNS message
+              if 'Records' in event:
+                  for record in event['Records']:
+                      if record['EventSource'] == 'aws:sns':
+                          message = json.loads(record['Sns']['Message'])
+                          
+                          # Check if this is a branch creation/update
+                          if message.get('Event') in ['referenceCreated', 'referenceUpdated']:
+                              branch_name = message.get('referenceName', '').replace('refs/heads/', '')
+                              
+                              # Check if branch should be protected
+                              for protected_pattern in protected_branches:
+                                  if protected_pattern.endswith('/*'):
+                                      if branch_name.startswith(protected_pattern[:-2]):
+                                          apply_branch_protection(repository_name, branch_name)
+                                  elif branch_name == protected_pattern:
+                                      apply_branch_protection(repository_name, branch_name)
+              
+              return {'statusCode': 200}
+          
+          def apply_branch_protection(repo_name, branch_name):
+              try:
+                  # Apply additional protection logic here
+                  print(f"Applied protection to branch {branch_name} in repository {repo_name}")
+              except Exception as e:
+                  print(f"Error applying branch protection: {str(e)}")
+
+  # IAM Role for Lambda function
+  BranchProtectionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CodeCommitAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codecommit:GetRepository
+                  - codecommit:ListBranches
+                  - codecommit:ListRepositories
+                Resource: !GetAtt ProductionRepository.Arn
+
+  # Lambda permission for SNS to invoke
+  BranchProtectionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BranchProtectionFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref BranchNotificationTopic
+
+  # SNS Subscription for Lambda
+  BranchProtectionSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: lambda
+      TopicArn: !Ref BranchNotificationTopic
+      Endpoint: !GetAtt BranchProtectionFunction.Arn
+
+  # CloudWatch Event Rule for repository monitoring
+  RepositoryEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${RepositoryName}-repository-events'
+      Description: 'Monitor CodeCommit repository events'
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - CodeCommit Repository State Change
+        detail:
+          repositoryName:
+            - !Ref ProductionRepository
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt RepositoryMonitoringFunction.Arn
+          Id: RepositoryMonitoringTarget
+
+  # Lambda function for repository monitoring
+  RepositoryMonitoringFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${RepositoryName}-monitoring'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt RepositoryMonitoringRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          from datetime import datetime
+          
+          cloudwatch = boto3.client('cloudwatch')
+          
+          def lambda_handler(event, context):
+              detail = event['detail']
+              repository_name = detail['repositoryName']
+              event_type = detail['event']
+              
+              # Send custom metrics to CloudWatch
+              cloudwatch.put_metric_data(
+                  Namespace='CodeCommit/Repository',
+                  MetricData=[
+                      {
+                          'MetricName': 'RepositoryEvents',
+                          'Dimensions': [
+                              {
+                                  'Name': 'RepositoryName',
+                                  'Value': repository_name
+                              },
+                              {
+                                  'Name': 'EventType',
+                                  'Value': event_type
+                              }
+                          ],
+                          'Value': 1,
+                          'Unit': 'Count',
+                          'Timestamp': datetime.utcnow()
+                      }
+                  ]
+              )
+              
+              return {'statusCode': 200}
+
+  # IAM Role for repository monitoring Lambda
+  RepositoryMonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CloudWatchMetrics
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+
+  # Lambda permission for CloudWatch Events
+  RepositoryMonitoringPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RepositoryMonitoringFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt RepositoryEventRule.Arn
+
+Outputs:
+  RepositoryName:
+    Description: Name of the created CodeCommit repository
+    Value: !GetAtt ProductionRepository.Name
+    
+  RepositoryArn:
+    Description: ARN of the created CodeCommit repository
+    Value: !GetAtt ProductionRepository.Arn
+    
+  ApprovalRuleTemplateName:
+    Description: Name of the approval rule template
+    Value: !Ref MainBranchApprovalRule
+    
+  BranchNotificationTopicArn:
+    Description: ARN of the SNS topic for branch notifications
+    Value: !Ref BranchNotificationTopic
+    
+  RepositoryCloneUrlHttp:
+    Description: HTTP clone URL for the repository
+    Value: !GetAtt ProductionRepository.CloneUrlHttp

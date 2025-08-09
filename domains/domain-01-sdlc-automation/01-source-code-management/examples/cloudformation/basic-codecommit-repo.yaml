@@ -1,0 +1,180 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Basic CodeCommit repository with IAM policies for source code management'
+
+Parameters:
+  RepositoryName:
+    Type: String
+    Description: Name of the CodeCommit repository
+    Default: my-application
+    AllowedPattern: '^[a-zA-Z0-9._-]+$'
+    ConstraintDescription: Repository name can contain letters, numbers, periods, hyphens, and underscores
+  
+  RepositoryDescription:
+    Type: String
+    Description: Description for the repository
+    Default: Main application repository for DevOps pipeline
+    
+  TeamName:
+    Type: String
+    Description: Name of the development team
+    Default: DevOpsTeam
+
+Resources:
+  # CodeCommit Repository
+  ApplicationRepository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Ref RepositoryName
+      RepositoryDescription: !Ref RepositoryDescription
+      Tags:
+        - Key: Team
+          Value: !Ref TeamName
+        - Key: Purpose
+          Value: SourceControl
+        - Key: Environment
+          Value: Development
+
+  # IAM Role for developers with read/write access
+  DeveloperRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${RepositoryName}-Developer-Role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref DeveloperPolicy
+      Tags:
+        - Key: Team
+          Value: !Ref TeamName
+
+  # IAM Policy for developers
+  DeveloperPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${RepositoryName}-Developer-Policy'
+      Description: Policy for developers to access CodeCommit repository
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - codecommit:BatchGetRepositories
+              - codecommit:Get*
+              - codecommit:List*
+              - codecommit:GitPull
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - codecommit:GitPush
+              - codecommit:Merge*
+              - codecommit:Put*
+              - codecommit:Create*
+              - codecommit:Update*
+              - codecommit:Test*
+            Resource: !GetAtt ApplicationRepository.Arn
+          - Effect: Allow
+            Action:
+              - codecommit:CreatePullRequest
+              - codecommit:CreatePullRequestApprovalRule
+              - codecommit:DescribePullRequestEvents
+              - codecommit:GetPullRequest
+              - codecommit:ListPullRequests
+              - codecommit:MergePullRequestByFastForward
+              - codecommit:PostCommentForPullRequest
+              - codecommit:UpdatePullRequestApprovalRuleContent
+              - codecommit:UpdatePullRequestDescription
+              - codecommit:UpdatePullRequestStatus
+              - codecommit:UpdatePullRequestTitle
+            Resource: !GetAtt ApplicationRepository.Arn
+
+  # IAM Role for CI/CD pipeline (read-only)
+  CICDRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${RepositoryName}-CICD-Role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref CICDPolicy
+      Tags:
+        - Key: Team
+          Value: !Ref TeamName
+
+  # IAM Policy for CI/CD pipeline
+  CICDPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${RepositoryName}-CICD-Policy'
+      Description: Policy for CI/CD pipeline to access CodeCommit repository
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - codecommit:BatchGetRepositories
+              - codecommit:Get*
+              - codecommit:List*
+              - codecommit:GitPull
+              - codecommit:UploadArchive
+            Resource: !GetAtt ApplicationRepository.Arn
+
+  # CloudWatch Log Group for monitoring
+  RepositoryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/codecommit/${RepositoryName}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Team
+          Value: !Ref TeamName
+
+Outputs:
+  RepositoryName:
+    Description: Name of the created CodeCommit repository
+    Value: !GetAtt ApplicationRepository.Name
+    Export:
+      Name: !Sub '${AWS::StackName}-RepositoryName'
+      
+  RepositoryArn:
+    Description: ARN of the created CodeCommit repository
+    Value: !GetAtt ApplicationRepository.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RepositoryArn'
+      
+  RepositoryCloneUrlHttp:
+    Description: HTTP clone URL for the repository
+    Value: !GetAtt ApplicationRepository.CloneUrlHttp
+    Export:
+      Name: !Sub '${AWS::StackName}-CloneUrlHttp'
+      
+  RepositoryCloneUrlSsh:
+    Description: SSH clone URL for the repository
+    Value: !GetAtt ApplicationRepository.CloneUrlSsh
+    Export:
+      Name: !Sub '${AWS::StackName}-CloneUrlSsh'
+      
+  DeveloperRoleArn:
+    Description: ARN of the developer role
+    Value: !GetAtt DeveloperRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DeveloperRoleArn'
+      
+  CICDRoleArn:
+    Description: ARN of the CI/CD role
+    Value: !GetAtt CICDRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CICDRoleArn'

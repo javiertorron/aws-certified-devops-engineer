@@ -1,0 +1,702 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'SOC 2 Type II Compliance Infrastructure Stack'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Description: Name of the project
+    Default: soc2-compliance
+  
+  Environment:
+    Type: String
+    Description: Environment name
+    Default: production
+    AllowedValues:
+      - development
+      - staging
+      - production
+  
+  DataClassification:
+    Type: String
+    Description: Data classification level
+    Default: Confidential
+    AllowedValues:
+      - Public
+      - Internal
+      - Confidential
+      - Restricted
+  
+  ComplianceOfficerEmail:
+    Type: String
+    Description: Email address of the compliance officer
+    Default: compliance@example.com
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - Environment
+          - DataClassification
+      - Label:
+          default: "Compliance Configuration"
+        Parameters:
+          - ComplianceOfficerEmail
+
+Resources:
+  # SOC 2 Security - KMS Key for encryption
+  SOC2EncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: SOC 2 compliant KMS key for data encryption
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow CloudTrail Encryption
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action:
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+          - Sid: Allow S3 Service
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+      KeyRotationStatus: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-soc2-encryption-key'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Compliance
+          Value: SOC2
+        - Key: DataClassification
+          Value: !Ref DataClassification
+
+  # KMS Key Alias
+  SOC2EncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-soc2-key'
+      TargetKeyId: !Ref SOC2EncryptionKey
+
+  # SOC 2 Security - Secure S3 Bucket for sensitive data
+  SOC2SecureBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-soc2-secure-${AWS::AccountId}'
+      # Enable versioning for data integrity
+      VersioningConfiguration:
+        Status: Enabled
+      
+      # Mandatory encryption with customer-managed KMS key
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref SOC2EncryptionKey
+            BucketKeyEnabled: true
+      
+      # Block all public access
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      
+      # Enable access logging
+      LoggingConfiguration:
+        DestinationBucketName: !Ref SOC2AccessLogsBucket
+        LogFilePrefix: soc2-access-logs/
+      
+      # Configure lifecycle for data retention
+      LifecycleConfiguration:
+        Rules:
+          - Id: SOC2DataRetention
+            Status: Enabled
+            ExpirationInDays: 2555  # 7 years retention
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+              - TransitionInDays: 365
+                StorageClass: DEEP_ARCHIVE
+            NoncurrentVersionTransitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+            NoncurrentVersionExpirationInDays: 365
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      
+      # Enable notifications for compliance monitoring
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref SOC2ComplianceLogGroup
+        
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt SOC2ComplianceMonitor.Arn
+      
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-soc2-secure-bucket'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Compliance
+          Value: SOC2
+        - Key: DataClassification
+          Value: !Ref DataClassification
+        - Key: BackupRequired
+          Value: 'true'
+
+  # Access logs bucket
+  SOC2AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-soc2-access-logs-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref SOC2EncryptionKey
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: AccessLogRetention
+            Status: Enabled
+            ExpirationInDays: 2555  # 7 years
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+
+  # SOC 2 Security - Comprehensive bucket policy
+  SOC2SecureBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SOC2SecureBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Deny insecure connections
+          - Sid: DenyInsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt SOC2SecureBucket.Arn
+              - !Sub '${SOC2SecureBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+          
+          # Require KMS encryption
+          - Sid: RequireKMSEncryption
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:PutObject'
+            Resource: !Sub '${SOC2SecureBucket.Arn}/*'
+            Condition:
+              StringNotEquals:
+                's3:x-amz-server-side-encryption': 'aws:kms'
+          
+          # Require specific KMS key
+          - Sid: RequireSpecificKMSKey
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:PutObject'
+            Resource: !Sub '${SOC2SecureBucket.Arn}/*'
+            Condition:
+              StringNotEquals:
+                's3:x-amz-server-side-encryption-aws-kms-key-id': !Ref SOC2EncryptionKey
+          
+          # Require MFA for deletion
+          - Sid: RequireMFAForDeletion
+            Effect: Deny
+            Principal: '*'
+            Action:
+              - 's3:DeleteObject'
+              - 's3:DeleteObjectVersion'
+            Resource: !Sub '${SOC2SecureBucket.Arn}/*'
+            Condition:
+              BoolIfExists:
+                'aws:MultiFactorAuthPresent': 'false'
+
+  # SOC 2 Availability - CloudTrail for audit logging
+  SOC2CloudTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: SOC2CloudTrailBucketPolicy
+    Properties:
+      TrailName: !Sub '${ProjectName}-soc2-audit-trail'
+      S3BucketName: !Ref SOC2CloudTrailBucket
+      S3KeyPrefix: soc2-audit-logs/
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: true
+      EnableLogFileValidation: true
+      KMSKeyId: !Ref SOC2EncryptionKey
+      
+      # Enable data events for sensitive buckets
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+          DataResources:
+            - Type: 'AWS::S3::Object'
+              Values: 
+                - !Sub '${SOC2SecureBucket}/*'
+            - Type: 'AWS::S3::Bucket'
+              Values: 
+                - !Ref SOC2SecureBucket
+      
+      # Enable CloudTrail Insights
+      InsightSelectors:
+        - InsightType: ApiCallRateInsight
+      
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-soc2-cloudtrail'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Compliance
+          Value: SOC2
+
+  # CloudTrail S3 bucket
+  SOC2CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-soc2-cloudtrail-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref SOC2EncryptionKey
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: CloudTrailLogRetention
+            Status: Enabled
+            ExpirationInDays: 2555  # 7 years
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+              - TransitionInDays: 365
+                StorageClass: DEEP_ARCHIVE
+
+  # CloudTrail bucket policy
+  SOC2CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SOC2CloudTrailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt SOC2CloudTrailBucket.Arn
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub 'arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${ProjectName}-soc2-audit-trail'
+          
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${SOC2CloudTrailBucket.Arn}/soc2-audit-logs/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+                'AWS:SourceArn': !Sub 'arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${ProjectName}-soc2-audit-trail'
+
+  # SOC 2 Processing Integrity - Config for continuous monitoring
+  SOC2ConfigRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Properties:
+      Name: !Sub '${ProjectName}-soc2-config-recorder'
+      RoleARN: !GetAtt SOC2ConfigRole.Arn
+      RecordingGroup:
+        AllSupported: true
+        IncludeGlobalResourceTypes: true
+
+  # Config delivery channel
+  SOC2ConfigDeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    Properties:
+      Name: !Sub '${ProjectName}-soc2-config-delivery'
+      S3BucketName: !Ref SOC2ConfigBucket
+      S3KeyPrefix: soc2-config/
+      ConfigSnapshotDeliveryProperties:
+        DeliveryFrequency: TwentyFour_Hours
+
+  # Config bucket
+  SOC2ConfigBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-soc2-config-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref SOC2EncryptionKey
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # Config service role
+  SOC2ConfigRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-soc2-config-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/ConfigRole
+      Policies:
+        - PolicyName: ConfigBucketAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketAcl
+                  - s3:ListBucket
+                Resource: !GetAtt SOC2ConfigBucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub '${SOC2ConfigBucket.Arn}/*'
+
+  # SOC 2 Config Rules
+  SOC2EncryptedVolumesRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: SOC2ConfigRecorder
+    Properties:
+      ConfigRuleName: soc2-encrypted-volumes
+      Description: Ensures EBS volumes are encrypted (SOC 2 Security)
+      Source:
+        Owner: AWS
+        SourceIdentifier: ENCRYPTED_VOLUMES
+
+  SOC2S3BucketSSLRequestsOnlyRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: SOC2ConfigRecorder
+    Properties:
+      ConfigRuleName: soc2-s3-ssl-requests-only
+      Description: Ensures S3 buckets require SSL (SOC 2 Security)
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_BUCKET_SSL_REQUESTS_ONLY
+
+  SOC2RootAccessKeyRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: SOC2ConfigRecorder
+    Properties:
+      ConfigRuleName: soc2-root-access-key-check
+      Description: Ensures root access keys are not present (SOC 2 Security)
+      Source:
+        Owner: AWS
+        SourceIdentifier: ROOT_ACCESS_KEY_CHECK
+
+  SOC2MFAEnabledForIAMConsoleAccessRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: SOC2ConfigRecorder
+    Properties:
+      ConfigRuleName: soc2-mfa-enabled-for-iam-console-access
+      Description: Ensures MFA is enabled for console access (SOC 2 Security)
+      Source:
+        Owner: AWS
+        SourceIdentifier: MFA_ENABLED_FOR_IAM_CONSOLE_ACCESS
+
+  # SOC 2 Confidentiality - Lambda for compliance monitoring
+  SOC2ComplianceMonitor:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-soc2-compliance-monitor'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt SOC2ComplianceMonitorRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref SOC2ComplianceAlerts
+          COMPLIANCE_FRAMEWORK: SOC2
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          from datetime import datetime
+          
+          def lambda_handler(event, context):
+              """
+              SOC 2 Compliance monitoring function
+              Monitors for compliance violations and sends alerts
+              """
+              
+              sns_client = boto3.client('sns')
+              s3_client = boto3.client('s3')
+              
+              # Process S3 events
+              for record in event.get('Records', []):
+                  if 's3' in record:
+                      bucket = record['s3']['bucket']['name']
+                      key = record['s3']['object']['key']
+                      
+                      # Check if object is properly encrypted
+                      try:
+                          response = s3_client.head_object(Bucket=bucket, Key=key)
+                          encryption = response.get('ServerSideEncryption')
+                          
+                          if encryption != 'aws:kms':
+                              alert = {
+                                  'timestamp': datetime.utcnow().isoformat(),
+                                  'compliance_framework': 'SOC2',
+                                  'violation_type': 'Encryption',
+                                  'resource': f's3://{bucket}/{key}',
+                                  'description': 'Object uploaded without KMS encryption',
+                                  'severity': 'HIGH'
+                              }
+                              
+                              sns_client.publish(
+                                  TopicArn=os.environ['SNS_TOPIC_ARN'],
+                                  Message=json.dumps(alert, indent=2),
+                                  Subject='SOC 2 Compliance Violation: Encryption'
+                              )
+                      
+                      except Exception as e:
+                          print(f'Error processing {bucket}/{key}: {str(e)}')
+              
+              return {'statusCode': 200}
+      
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-soc2-monitor'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Compliance
+          Value: SOC2
+
+  # Lambda execution role
+  SOC2ComplianceMonitorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-soc2-monitor-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SOC2MonitoringPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectMetadata
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${SOC2SecureBucket.Arn}/*'
+                  - !GetAtt SOC2SecureBucket.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SOC2ComplianceAlerts
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # Lambda permission for S3
+  SOC2LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SOC2ComplianceMonitor
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: !GetAtt SOC2SecureBucket.Arn
+
+  # SNS topic for compliance alerts
+  SOC2ComplianceAlerts:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-soc2-compliance-alerts'
+      DisplayName: SOC 2 Compliance Alerts
+      KmsMasterKeyId: !Ref SOC2EncryptionKey
+
+  # SNS subscription for compliance officer
+  SOC2ComplianceSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref SOC2ComplianceAlerts
+      Protocol: email
+      Endpoint: !Ref ComplianceOfficerEmail
+
+  # CloudWatch Log Group for SOC 2 compliance events
+  SOC2ComplianceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/compliance/soc2/${ProjectName}'
+      RetentionInDays: 2555  # 7 years for SOC 2 compliance
+      KmsKeyId: !GetAtt SOC2EncryptionKey.Arn
+
+  # EventBridge rule for Config compliance changes
+  SOC2ConfigComplianceRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-soc2-config-compliance'
+      Description: Capture Config compliance changes for SOC 2
+      EventPattern:
+        source:
+          - aws.config
+        detail-type:
+          - Config Rules Compliance Change
+        detail:
+          newEvaluationResult:
+            complianceType:
+              - NON_COMPLIANT
+          configRuleName:
+            - prefix: soc2-
+      Targets:
+        - Arn: !Ref SOC2ComplianceAlerts
+          Id: SOC2ConfigAlert
+
+  # CloudWatch Dashboard for SOC 2 compliance monitoring
+  SOC2ComplianceDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-soc2-compliance'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Config", "ComplianceByConfigRule", "RuleName", "soc2-encrypted-volumes", "ComplianceType", "NON_COMPLIANT" ],
+                  [ ".", ".", ".", "soc2-s3-ssl-requests-only", ".", "." ],
+                  [ ".", ".", ".", "soc2-root-access-key-check", ".", "." ],
+                  [ ".", ".", ".", "soc2-mfa-enabled-for-iam-console-access", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Maximum",
+                "region": "${AWS::Region}",
+                "title": "SOC 2 Config Rules Non-Compliance"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${ProjectName}-soc2-compliance-monitor" ],
+                  [ ".", "Errors", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "SOC 2 Compliance Monitor Activity"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/compliance/soc2/${ProjectName}'\n| fields @timestamp, @message\n| sort @timestamp desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Recent SOC 2 Compliance Events"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  SOC2EncryptionKeyId:
+    Description: KMS Key ID for SOC 2 encryption
+    Value: !Ref SOC2EncryptionKey
+    Export:
+      Name: !Sub '${AWS::StackName}-SOC2-KMS-Key'
+
+  SOC2SecureBucketName:
+    Description: Name of the SOC 2 compliant secure bucket
+    Value: !Ref SOC2SecureBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-SOC2-Secure-Bucket'
+
+  SOC2CloudTrailArn:
+    Description: ARN of the SOC 2 CloudTrail
+    Value: !GetAtt SOC2CloudTrail.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SOC2-CloudTrail-Arn'
+
+  SOC2ComplianceAlertsTopicArn:
+    Description: ARN of the SOC 2 compliance alerts SNS topic
+    Value: !Ref SOC2ComplianceAlerts
+    Export:
+      Name: !Sub '${AWS::StackName}-SOC2-Alerts-Topic'
+
+  SOC2DashboardURL:
+    Description: URL to the SOC 2 compliance dashboard
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-soc2-compliance'
+
+  ComplianceFramework:
+    Description: Compliance framework implemented
+    Value: SOC2-TypeII

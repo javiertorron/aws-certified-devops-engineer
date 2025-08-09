@@ -1,0 +1,623 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Enterprise CodeCommit setup with advanced features, monitoring, and automation'
+
+Parameters:
+  OrganizationName:
+    Type: String
+    Description: Organization name for resource naming
+    Default: MyCompany
+    
+  ProjectName:
+    Type: String
+    Description: Project name
+    Default: WebApp
+    
+  Environment:
+    Type: String
+    Description: Environment type
+    Default: Production
+    AllowedValues: [Development, Staging, Production]
+    
+  TeamEmail:
+    Type: String
+    Description: Team email for notifications
+    AllowedPattern: '^[^\s@]+@[^\s@]+\.[^\s@]+$'
+    
+  KMSKeyId:
+    Type: String
+    Description: KMS Key ID for encryption (optional)
+    Default: ''
+    
+  EnableVPCEndpoint:
+    Type: String
+    Description: Enable VPC endpoint for private access
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    
+  VPCId:
+    Type: String
+    Description: VPC ID for endpoint creation (required if EnableVPCEndpoint is true)
+    Default: ''
+    
+  SubnetIds:
+    Type: CommaDelimitedList
+    Description: Subnet IDs for VPC endpoint (required if EnableVPCEndpoint is true)
+    Default: ''
+
+Conditions:
+  HasCustomKMSKey: !Not [!Equals [!Ref KMSKeyId, '']]
+  CreateVPCEndpoint: !Equals [!Ref EnableVPCEndpoint, 'true']
+  IsProduction: !Equals [!Ref Environment, 'Production']
+
+Resources:
+  # Primary CodeCommit Repository
+  PrimaryRepository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Sub '${OrganizationName}-${ProjectName}-${Environment}'
+      RepositoryDescription: !Sub 'Primary repository for ${ProjectName} in ${Environment} environment'
+      KmsKeyId: !If [HasCustomKMSKey, !Ref KMSKeyId, !Ref 'AWS::NoValue']
+      Triggers:
+        - Name: MainBranchTrigger
+          DestinationArn: !Ref RepositoryNotificationTopic
+          Events:
+            - updateReference
+          Branches:
+            - main
+            - master
+        - Name: DevelopBranchTrigger
+          DestinationArn: !Ref RepositoryNotificationTopic
+          Events:
+            - updateReference
+            - createReference
+          Branches:
+            - develop
+            - staging
+        - Name: PullRequestTrigger
+          DestinationArn: !Ref PullRequestProcessorFunction
+          Events:
+            - pullRequestCreated
+            - pullRequestMergeStatusUpdated
+      Tags:
+        - Key: Organization
+          Value: !Ref OrganizationName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: BackupRequired
+          Value: !If [IsProduction, 'true', 'false']
+
+  # Infrastructure Repository for IaC
+  InfrastructureRepository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Sub '${OrganizationName}-${ProjectName}-infrastructure'
+      RepositoryDescription: !Sub 'Infrastructure as Code repository for ${ProjectName}'
+      KmsKeyId: !If [HasCustomKMSKey, !Ref KMSKeyId, !Ref 'AWS::NoValue']
+      Triggers:
+        - Name: InfrastructureChangeTrigger
+          DestinationArn: !Ref InfrastructureChangesTopic
+          Events:
+            - updateReference
+          Branches:
+            - main
+            - production
+      Tags:
+        - Key: Organization
+          Value: !Ref OrganizationName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Type
+          Value: Infrastructure
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # SNS Topic for repository notifications
+  RepositoryNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${OrganizationName}-${ProjectName}-codecommit-notifications'
+      DisplayName: !Sub '${ProjectName} CodeCommit Notifications'
+      KmsMasterKeyId: !If [HasCustomKMSKey, !Ref KMSKeyId, 'alias/aws/sns']
+
+  # SNS Topic for infrastructure changes
+  InfrastructureChangesTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${OrganizationName}-${ProjectName}-infrastructure-changes'
+      DisplayName: !Sub '${ProjectName} Infrastructure Changes'
+      KmsMasterKeyId: !If [HasCustomKMSKey, !Ref KMSKeyId, 'alias/aws/sns']
+
+  # Email subscription for team notifications
+  TeamEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref RepositoryNotificationTopic
+      Endpoint: !Ref TeamEmail
+
+  # Infrastructure changes email subscription
+  InfrastructureEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref InfrastructureChangesTopic
+      Endpoint: !Ref TeamEmail
+
+  # Lambda function for pull request processing
+  PullRequestProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${OrganizationName}-${ProjectName}-pr-processor'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Timeout: 300
+      Role: !GetAtt PullRequestProcessorRole.Arn
+      Environment:
+        Variables:
+          REPOSITORY_NAME: !GetAtt PrimaryRepository.Name
+          NOTIFICATION_TOPIC_ARN: !Ref RepositoryNotificationTopic
+          CODEGURU_REVIEWER_ENABLED: !If [IsProduction, 'true', 'false']
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          
+          codecommit = boto3.client('codecommit')
+          sns = boto3.client('sns')
+          codeguru_reviewer = boto3.client('codeguru-reviewer')
+          
+          def lambda_handler(event, context):
+              try:
+                  # Parse CodeCommit event
+                  detail = event.get('detail', {})
+                  repository_name = detail.get('repositoryName')
+                  pull_request_id = detail.get('pullRequestId')
+                  event_type = detail.get('event')
+                  
+                  print(f"Processing event: {event_type} for PR {pull_request_id}")
+                  
+                  if event_type == 'pullRequestCreated':
+                      handle_pr_created(repository_name, pull_request_id)
+                  elif event_type == 'pullRequestMergeStatusUpdated':
+                      handle_pr_merge_status_updated(repository_name, pull_request_id)
+                  
+                  return {'statusCode': 200}
+                  
+              except Exception as e:
+                  print(f"Error processing pull request event: {str(e)}")
+                  return {'statusCode': 500, 'body': str(e)}
+          
+          def handle_pr_created(repository_name, pull_request_id):
+              # Get pull request details
+              pr_response = codecommit.get_pull_request(pullRequestId=pull_request_id)
+              pr = pr_response['pullRequest']
+              
+              # Auto-assign reviewers based on file changes
+              assign_reviewers(repository_name, pull_request_id, pr)
+              
+              # Enable CodeGuru Reviewer if in production
+              if os.getenv('CODEGURU_REVIEWER_ENABLED') == 'true':
+                  enable_codeguru_review(repository_name)
+              
+              # Send notification
+              send_pr_notification(pr, 'created')
+          
+          def handle_pr_merge_status_updated(repository_name, pull_request_id):
+              pr_response = codecommit.get_pull_request(pullRequestId=pull_request_id)
+              pr = pr_response['pullRequest']
+              
+              if pr['pullRequestStatus'] == 'CLOSED':
+                  if pr.get('pullRequestTargets', [{}])[0].get('mergeMetadata', {}).get('isMerged'):
+                      send_pr_notification(pr, 'merged')
+                  else:
+                      send_pr_notification(pr, 'closed')
+          
+          def assign_reviewers(repository_name, pull_request_id, pr):
+              # Get changed files to determine appropriate reviewers
+              try:
+                  source_commit = pr['pullRequestTargets'][0]['sourceCommit']
+                  destination_commit = pr['pullRequestTargets'][0]['destinationCommit']
+                  
+                  # This is a simplified reviewer assignment
+                  # In practice, you'd analyze changed files and assign accordingly
+                  pass
+              except Exception as e:
+                  print(f"Error assigning reviewers: {str(e)}")
+          
+          def enable_codeguru_review(repository_name):
+              try:
+                  # Check if CodeGuru Reviewer is already associated
+                  associations = codeguru_reviewer.list_repository_associations()
+                  
+                  for assoc in associations.get('RepositoryAssociations', []):
+                      if assoc['Repository']['CodeCommit']['Name'] == repository_name:
+                          print("CodeGuru Reviewer already enabled")
+                          return
+                  
+                  # Enable CodeGuru Reviewer
+                  codeguru_reviewer.associate_repository(
+                      Repository={'CodeCommit': {'Name': repository_name}},
+                      Type='CodeCommit'
+                  )
+                  print("CodeGuru Reviewer enabled")
+              except Exception as e:
+                  print(f"Error enabling CodeGuru Reviewer: {str(e)}")
+          
+          def send_pr_notification(pr, action):
+              try:
+                  message = f"""
+                  Pull Request {action.upper()}:
+                  
+                  Title: {pr['title']}
+                  Description: {pr.get('description', 'No description')}
+                  Author: {pr.get('authorArn', 'Unknown')}
+                  Status: {pr['pullRequestStatus']}
+                  Created: {pr['creationDate']}
+                  
+                  Repository: {pr['pullRequestTargets'][0]['repositoryName']}
+                  Source: {pr['pullRequestTargets'][0]['sourceReference']}
+                  Destination: {pr['pullRequestTargets'][0]['destinationReference']}
+                  """
+                  
+                  sns.publish(
+                      TopicArn=os.getenv('NOTIFICATION_TOPIC_ARN'),
+                      Subject=f'Pull Request {action}: {pr["title"]}',
+                      Message=message
+                  )
+              except Exception as e:
+                  print(f"Error sending notification: {str(e)}")
+
+  # IAM Role for Lambda function
+  PullRequestProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CodeCommitAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codecommit:GetPullRequest
+                  - codecommit:GetCommit
+                  - codecommit:GetDifferences
+                  - codecommit:CreatePullRequestApprovalRule
+                  - codecommit:UpdatePullRequestApprovalRuleContent
+                Resource:
+                  - !GetAtt PrimaryRepository.Arn
+                  - !GetAtt InfrastructureRepository.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  - !Ref RepositoryNotificationTopic
+                  - !Ref InfrastructureChangesTopic
+              - Effect: Allow
+                Action:
+                  - codeguru-reviewer:AssociateRepository
+                  - codeguru-reviewer:ListRepositoryAssociations
+                Resource: '*'
+
+  # Lambda permission for repository triggers
+  PullRequestProcessorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PullRequestProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: codecommit.amazonaws.com
+      SourceArn: !GetAtt PrimaryRepository.Arn
+
+  # Approval Rule Template for production
+  ProductionApprovalRuleTemplate:
+    Type: AWS::CodeCommit::ApprovalRuleTemplate
+    Condition: IsProduction
+    Properties:
+      ApprovalRuleTemplateName: !Sub '${OrganizationName}-${ProjectName}-production-approval'
+      ApprovalRuleTemplateDescription: 'Approval rule requiring senior developer approval for production'
+      ApprovalRuleTemplateContent: !Sub |
+        {
+          "Version": "2018-11-08",
+          "DestinationReferences": ["refs/heads/main", "refs/heads/master"],
+          "Statements": [
+            {
+              "Type": "Approvers",
+              "NumberOfApprovalsNeeded": 2,
+              "ApprovalPoolMembers": [
+                "arn:aws:iam::${AWS::AccountId}:role/SeniorDeveloper",
+                "arn:aws:iam::${AWS::AccountId}:role/TechLead"
+              ]
+            }
+          ]
+        }
+
+  # Associate approval rule with repository
+  ProductionApprovalRuleAssociation:
+    Type: AWS::CodeCommit::ApprovalRuleTemplateAssociation
+    Condition: IsProduction
+    Properties:
+      ApprovalRuleTemplateName: !Ref ProductionApprovalRuleTemplate
+      RepositoryName: !GetAtt PrimaryRepository.Name
+
+  # Infrastructure approval rule template
+  InfrastructureApprovalRuleTemplate:
+    Type: AWS::CodeCommit::ApprovalRuleTemplate
+    Properties:
+      ApprovalRuleTemplateName: !Sub '${OrganizationName}-infrastructure-approval'
+      ApprovalRuleTemplateDescription: 'Approval rule for infrastructure changes'
+      ApprovalRuleTemplateContent: !Sub |
+        {
+          "Version": "2018-11-08",
+          "DestinationReferences": ["refs/heads/main", "refs/heads/production"],
+          "Statements": [
+            {
+              "Type": "Approvers",
+              "NumberOfApprovalsNeeded": 1,
+              "ApprovalPoolMembers": [
+                "arn:aws:iam::${AWS::AccountId}:role/DevOpsEngineer",
+                "arn:aws:iam::${AWS::AccountId}:role/InfrastructureAdmin"
+              ]
+            }
+          ]
+        }
+
+  # Associate infrastructure approval rule
+  InfrastructureApprovalRuleAssociation:
+    Type: AWS::CodeCommit::ApprovalRuleTemplateAssociation
+    Properties:
+      ApprovalRuleTemplateName: !Ref InfrastructureApprovalRuleTemplate
+      RepositoryName: !GetAtt InfrastructureRepository.Name
+
+  # VPC Endpoint for private CodeCommit access
+  CodeCommitVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateVPCEndpoint
+    Properties:
+      VpcId: !Ref VPCId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.codecommit'
+      VpcEndpointType: Interface
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds:
+        - !Ref CodeCommitVPCEndpointSecurityGroup
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action:
+              - codecommit:GitPull
+              - codecommit:GitPush
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'aws:PrincipalVpc': !Ref VPCId
+
+  # Security Group for VPC Endpoint
+  CodeCommitVPCEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreateVPCEndpoint
+    Properties:
+      GroupDescription: Security group for CodeCommit VPC endpoint
+      VpcId: !Ref VPCId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.0.0.0/8
+          Description: HTTPS access from VPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS access to CodeCommit
+      Tags:
+        - Key: Name
+          Value: !Sub '${OrganizationName}-codecommit-vpce-sg'
+
+  # CloudWatch Log Group for monitoring
+  CodeCommitLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/codecommit/${OrganizationName}-${ProjectName}'
+      RetentionInDays: !If [IsProduction, 90, 30]
+
+  # CloudWatch Alarm for low repository activity
+  LowActivityAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${OrganizationName}-${ProjectName}-low-activity'
+      AlarmDescription: 'Alert when repository activity is low'
+      MetricName: 'CommitsPerDay'
+      Namespace: 'CodeCommit/Repository'
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - !Ref RepositoryNotificationTopic
+      Dimensions:
+        - Name: RepositoryName
+          Value: !GetAtt PrimaryRepository.Name
+
+  # EventBridge Rule for repository monitoring
+  RepositoryEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${OrganizationName}-${ProjectName}-repository-events'
+      Description: 'Monitor CodeCommit repository events'
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - CodeCommit Repository State Change
+        detail:
+          repositoryName:
+            - !GetAtt PrimaryRepository.Name
+            - !GetAtt InfrastructureRepository.Name
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt RepositoryMonitoringFunction.Arn
+          Id: RepositoryMonitoringTarget
+
+  # Lambda function for repository monitoring
+  RepositoryMonitoringFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${OrganizationName}-${ProjectName}-repo-monitor'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Timeout: 60
+      Role: !GetAtt RepositoryMonitoringRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          from datetime import datetime
+          
+          cloudwatch = boto3.client('cloudwatch')
+          
+          def lambda_handler(event, context):
+              try:
+                  detail = event['detail']
+                  repository_name = detail['repositoryName']
+                  event_type = detail['event']
+                  
+                  # Send custom metrics to CloudWatch
+                  cloudwatch.put_metric_data(
+                      Namespace='CodeCommit/Repository',
+                      MetricData=[
+                          {
+                              'MetricName': 'RepositoryEvents',
+                              'Dimensions': [
+                                  {
+                                      'Name': 'RepositoryName',
+                                      'Value': repository_name
+                                  },
+                                  {
+                                      'Name': 'EventType',
+                                      'Value': event_type
+                                  }
+                              ],
+                              'Value': 1,
+                              'Unit': 'Count',
+                              'Timestamp': datetime.utcnow()
+                          }
+                      ]
+                  )
+                  
+                  # Track commits per day
+                  if event_type == 'referenceUpdated':
+                      cloudwatch.put_metric_data(
+                          Namespace='CodeCommit/Repository',
+                          MetricData=[
+                              {
+                                  'MetricName': 'CommitsPerDay',
+                                  'Dimensions': [
+                                      {
+                                          'Name': 'RepositoryName',
+                                          'Value': repository_name
+                                      }
+                                  ],
+                                  'Value': 1,
+                                  'Unit': 'Count',
+                                  'Timestamp': datetime.utcnow()
+                              }
+                          ]
+                      )
+                  
+                  return {'statusCode': 200}
+                  
+              except Exception as e:
+                  print(f"Error in repository monitoring: {str(e)}")
+                  return {'statusCode': 500}
+
+  # IAM Role for repository monitoring Lambda
+  RepositoryMonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CloudWatchMetrics
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+
+  # Lambda permission for EventBridge
+  RepositoryMonitoringPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RepositoryMonitoringFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt RepositoryEventRule.Arn
+
+Outputs:
+  PrimaryRepositoryName:
+    Description: Name of the primary repository
+    Value: !GetAtt PrimaryRepository.Name
+    Export:
+      Name: !Sub '${AWS::StackName}-PrimaryRepository'
+      
+  PrimaryRepositoryArn:
+    Description: ARN of the primary repository
+    Value: !GetAtt PrimaryRepository.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PrimaryRepositoryArn'
+      
+  PrimaryRepositoryCloneUrl:
+    Description: Clone URL for the primary repository
+    Value: !GetAtt PrimaryRepository.CloneUrlHttp
+    Export:
+      Name: !Sub '${AWS::StackName}-PrimaryCloneUrl'
+      
+  InfrastructureRepositoryName:
+    Description: Name of the infrastructure repository
+    Value: !GetAtt InfrastructureRepository.Name
+    Export:
+      Name: !Sub '${AWS::StackName}-InfrastructureRepository'
+      
+  InfrastructureRepositoryCloneUrl:
+    Description: Clone URL for the infrastructure repository
+    Value: !GetAtt InfrastructureRepository.CloneUrlHttp
+    Export:
+      Name: !Sub '${AWS::StackName}-InfrastructureCloneUrl'
+      
+  NotificationTopicArn:
+    Description: ARN of the notification topic
+    Value: !Ref RepositoryNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopic'
+      
+  VPCEndpointId:
+    Condition: CreateVPCEndpoint
+    Description: VPC Endpoint ID for CodeCommit
+    Value: !Ref CodeCommitVPCEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCEndpoint'

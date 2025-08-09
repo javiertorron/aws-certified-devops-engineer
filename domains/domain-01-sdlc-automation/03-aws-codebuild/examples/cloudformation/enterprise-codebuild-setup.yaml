@@ -1,0 +1,880 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Enterprise CodeBuild setup with advanced features, monitoring, and multi-project support'
+
+Parameters:
+  OrganizationName:
+    Type: String
+    Description: Organization name for resource naming
+    Default: MyCompany
+    
+  ProjectPrefix:
+    Type: String
+    Description: Prefix for project names
+    Default: WebApp
+    
+  Environment:
+    Type: String
+    Description: Environment type
+    Default: Production
+    AllowedValues: [Development, Staging, Production]
+    
+  TeamEmail:
+    Type: String
+    Description: Team email for notifications
+    AllowedPattern: '^[^\s@]+@[^\s@]+\.[^\s@]+$'
+    
+  VPCId:
+    Type: String
+    Description: VPC ID for private builds (optional)
+    Default: ''
+    
+  PrivateSubnetIds:
+    Type: CommaDelimitedList
+    Description: Private subnet IDs for VPC builds (optional)
+    Default: ''
+    
+  ECRRepositoryURI:
+    Type: String
+    Description: ECR repository URI for custom build images
+    Default: ''
+
+Conditions:
+  HasVPC: !Not [!Equals [!Ref VPCId, '']]
+  HasECR: !Not [!Equals [!Ref ECRRepositoryURI, '']]
+  IsProduction: !Equals [!Ref Environment, 'Production']
+
+Resources:
+  # KMS Key for encryption
+  BuildEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'KMS key for ${OrganizationName} CodeBuild encryption'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow CodeBuild Service
+            Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+              - kms:Encrypt
+              - kms:GenerateDataKey*
+              - kms:ReEncrypt*
+            Resource: '*'
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${OrganizationName}-codebuild-key'
+        - Key: Organization
+          Value: !Ref OrganizationName
+        - Key: Environment
+          Value: !Ref Environment
+
+  BuildEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${OrganizationName}-codebuild'
+      TargetKeyId: !Ref BuildEncryptionKey
+
+  # S3 Bucket for Artifacts
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'codebuild-artifacts-${AWS::AccountId}-${AWS::Region}-${OrganizationName}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref BuildEncryptionKey
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: !If [IsProduction, 'Enabled', 'Suspended']
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldArtifacts
+            Status: Enabled
+            ExpirationInDays: !If [IsProduction, 90, 30]
+            NoncurrentVersionExpirationInDays: 7
+          - Id: DeleteIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref ArtifactsBucketLogGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${OrganizationName}-codebuild-artifacts'
+        - Key: Organization
+          Value: !Ref OrganizationName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # S3 Bucket for Build Cache
+  CacheBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'codebuild-cache-${AWS::AccountId}-${AWS::Region}-${OrganizationName}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref BuildEncryptionKey
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldCache
+            Status: Enabled
+            ExpirationInDays: 7
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              TransitionInDays: 1
+              StorageClass: STANDARD_INFREQUENT_ACCESS
+      Tags:
+        - Key: Name
+          Value: !Sub '${OrganizationName}-codebuild-cache'
+        - Key: Organization
+          Value: !Ref OrganizationName
+
+  # CloudWatch Log Groups
+  ArtifactsBucketLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${OrganizationName}-artifacts'
+      RetentionInDays: !If [IsProduction, 90, 30]
+      KmsKeyId: !GetAtt BuildEncryptionKey.Arn
+
+  CodeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${OrganizationName}-projects'
+      RetentionInDays: !If [IsProduction, 90, 30]
+      KmsKeyId: !GetAtt BuildEncryptionKey.Arn
+
+  # SNS Topic for Build Notifications
+  BuildNotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${OrganizationName}-codebuild-notifications'
+      DisplayName: !Sub '${OrganizationName} CodeBuild Notifications'
+      KmsMasterKeyId: !Ref BuildEncryptionKey
+      Tags:
+        - Key: Name
+          Value: !Sub '${OrganizationName}-codebuild-notifications'
+        - Key: Organization
+          Value: !Ref OrganizationName
+
+  BuildNotificationsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref BuildNotificationsTopic
+      Endpoint: !Ref TeamEmail
+
+  # Security Group for VPC builds
+  BuildSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: HasVPC
+    Properties:
+      GroupDescription: !Sub 'Security group for ${OrganizationName} CodeBuild VPC builds'
+      VpcId: !Ref VPCId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS outbound for AWS services
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP outbound for package downloads
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 10.0.0.0/8
+          Description: SSH for Git operations
+      Tags:
+        - Key: Name
+          Value: !Sub '${OrganizationName}-codebuild-sg'
+        - Key: Organization
+          Value: !Ref OrganizationName
+
+  # IAM Service Role for CodeBuild
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${OrganizationName}-CodeBuild-ServiceRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+      Policies:
+        - PolicyName: CodeBuildServicePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: LoggingPermissions
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub '${CodeBuildLogGroup.Arn}*'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${OrganizationName}-*'
+              - Sid: S3ArtifactsPermissions
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:GetBucketAcl
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub '${ArtifactsBucket}/*'
+                  - !GetAtt ArtifactsBucket.Arn
+                  - !Sub '${CacheBucket}/*'
+                  - !GetAtt CacheBucket.Arn
+              - Sid: CodeCommitPermissions
+                Effect: Allow
+                Action:
+                  - codecommit:GitPull
+                  - codecommit:ListBranches
+                  - codecommit:ListRepositories
+                Resource: !Sub 'arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:*'
+              - Sid: ECRPermissions
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchGetImage
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                Resource: '*'
+              - Sid: ParameterStorePermissions
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${OrganizationName}/*'
+              - Sid: SecretsManagerPermissions
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${OrganizationName}/*'
+              - Sid: KMSPermissions
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                  - kms:Encrypt
+                  - kms:GenerateDataKey*
+                  - kms:ReEncrypt*
+                Resource: !GetAtt BuildEncryptionKey.Arn
+              - Sid: SNSPermissions
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref BuildNotificationsTopic
+              - Sid: VPCPermissions
+                Effect: !If [HasVPC, Allow, Deny]
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeDhcpOptions
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DeleteNetworkInterface
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeVpcs
+                  - ec2:CreateNetworkInterfacePermission
+                Resource: '*'
+              - Sid: CloudWatchMetricsPermissions
+                Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${OrganizationName}-CodeBuild-ServiceRole'
+        - Key: Organization
+          Value: !Ref OrganizationName
+
+  # Batch Build Service Role
+  CodeBuildBatchServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${OrganizationName}-CodeBuild-BatchServiceRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildBatchServicePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:StopBuild
+                  - codebuild:RetryBuild
+                Resource: !Sub 'arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:project/${OrganizationName}-*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${OrganizationName}-CodeBuild-BatchServiceRole'
+        - Key: Organization
+          Value: !Ref OrganizationName
+
+  # NodeJS Build Project
+  NodeJSBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${OrganizationName}-${ProjectPrefix}-nodejs'
+      Description: !Sub 'Node.js build project for ${ProjectPrefix}'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      EncryptionKey: !GetAtt BuildEncryptionKey.Arn
+      Artifacts:
+        Type: S3
+        Location: !Sub '${ArtifactsBucket}/nodejs-builds'
+        Name: !Sub '${ProjectPrefix}-nodejs-artifacts'
+        OverrideArtifactName: true
+        Packaging: ZIP
+      Cache:
+        Type: S3
+        Location: !Sub '${CacheBucket}/nodejs-cache'
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:4.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: ORGANIZATION_NAME
+            Value: !Ref OrganizationName
+          - Name: PROJECT_PREFIX
+            Value: !Ref ProjectPrefix
+          - Name: ENVIRONMENT
+            Value: !Ref Environment
+          - Name: ARTIFACTS_BUCKET
+            Value: !Ref ArtifactsBucket
+          - Name: CACHE_BUCKET
+            Value: !Ref CacheBucket
+          - Name: SNS_TOPIC_ARN
+            Value: !Ref BuildNotificationsTopic
+      VpcConfig: !If
+        - HasVPC
+        - VpcId: !Ref VPCId
+          Subnets: !Ref PrivateSubnetIds
+          SecurityGroupIds:
+            - !Ref BuildSecurityGroup
+        - !Ref 'AWS::NoValue'
+      Source:
+        Type: CODECOMMIT
+        BuildSpec: |
+          version: 0.2
+          
+          env:
+            variables:
+              NODE_ENV: production
+            parameter-store:
+              BUILD_CONFIG: /$ORGANIZATION_NAME/build/config
+            
+          phases:
+            install:
+              runtime-versions:
+                nodejs: 18
+              commands:
+                - echo "Installing Node.js dependencies"
+                - npm ci --production=false
+                
+            pre_build:
+              commands:
+                - echo "Running pre-build checks"
+                - npm run lint
+                - npm run test:unit
+                - npm audit --audit-level moderate
+                
+            build:
+              commands:
+                - echo "Building Node.js application"
+                - npm run build
+                - npm run test:integration
+                
+            post_build:
+              commands:
+                - echo "Post-build activities"
+                - npm run test:e2e
+                - |
+                  # Send build notification
+                  aws sns publish \
+                    --topic-arn $SNS_TOPIC_ARN \
+                    --subject "Build Completed: $CODEBUILD_PROJECT_NAME" \
+                    --message "Build $CODEBUILD_BUILD_NUMBER completed successfully"
+                    
+          artifacts:
+            files:
+              - 'dist/**/*'
+              - 'package.json'
+              - 'package-lock.json'
+            name: nodejs-build-$CODEBUILD_BUILD_NUMBER
+            
+          cache:
+            paths:
+              - node_modules/**/*
+              - ~/.npm/**/*
+              
+          reports:
+            unit-tests:
+              files:
+                - 'coverage/lcov.info'
+              file-format: COBERTURAXML
+              
+      BuildBatchConfig:
+        ServiceRole: !GetAtt CodeBuildBatchServiceRole.Arn
+        Restrictions:
+          MaximumBuildsAllowed: 10
+          ComputeTypesAllowed:
+            - BUILD_GENERAL1_SMALL
+            - BUILD_GENERAL1_MEDIUM
+        TimeoutInMinutes: 60
+        BatchReportMode: REPORT_INDIVIDUAL_BUILDS
+      TimeoutInMinutes: 60
+      QueuedTimeoutInMinutes: 480
+      Tags:
+        - Key: Name
+          Value: !Sub '${OrganizationName}-${ProjectPrefix}-nodejs'
+        - Key: Organization
+          Value: !Ref OrganizationName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ApplicationType
+          Value: nodejs
+
+  # Docker Build Project
+  DockerBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${OrganizationName}-${ProjectPrefix}-docker'
+      Description: !Sub 'Docker build project for ${ProjectPrefix}'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      EncryptionKey: !GetAtt BuildEncryptionKey.Arn
+      Artifacts:
+        Type: S3
+        Location: !Sub '${ArtifactsBucket}/docker-builds'
+        Name: !Sub '${ProjectPrefix}-docker-artifacts'
+        OverrideArtifactName: true
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_LARGE
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:4.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref 'AWS::Region'
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref 'AWS::AccountId'
+          - Name: ECR_REPOSITORY_URI
+            Value: !If [HasECR, !Ref ECRRepositoryURI, '']
+          - Name: IMAGE_REPO_NAME
+            Value: !Sub '${OrganizationName}-${ProjectPrefix}'
+      VpcConfig: !If
+        - HasVPC
+        - VpcId: !Ref VPCId
+          Subnets: !Ref PrivateSubnetIds
+          SecurityGroupIds:
+            - !Ref BuildSecurityGroup
+        - !Ref 'AWS::NoValue'
+      Source:
+        Type: CODECOMMIT
+        BuildSpec: |
+          version: 0.2
+          
+          phases:
+            pre_build:
+              commands:
+                - echo "Logging in to Amazon ECR"
+                - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+                - REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME
+                - IMAGE_TAG=$CODEBUILD_BUILD_NUMBER
+                
+            build:
+              commands:
+                - echo "Build started on $(date)"
+                - echo "Building Docker image"
+                - docker build -t $REPOSITORY_URI:latest .
+                - docker tag $REPOSITORY_URI:latest $REPOSITORY_URI:$IMAGE_TAG
+                
+                # Security scanning
+                - echo "Running security scan"
+                - docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest image --exit-code 0 --no-progress --format table $REPOSITORY_URI:$IMAGE_TAG
+                
+            post_build:
+              commands:
+                - echo "Build completed on $(date)"
+                - echo "Pushing Docker image"
+                - docker push $REPOSITORY_URI:latest
+                - docker push $REPOSITORY_URI:$IMAGE_TAG
+                - echo "Writing image definitions file"
+                - printf '[{"name":"%s","imageUri":"%s"}]' $IMAGE_REPO_NAME $REPOSITORY_URI:$IMAGE_TAG > imagedefinitions.json
+                
+          artifacts:
+            files:
+              - imagedefinitions.json
+              
+      TimeoutInMinutes: 60
+      Tags:
+        - Key: Name
+          Value: !Sub '${OrganizationName}-${ProjectPrefix}-docker'
+        - Key: Organization
+          Value: !Ref OrganizationName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ApplicationType
+          Value: docker
+
+  # Python Build Project
+  PythonBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${OrganizationName}-${ProjectPrefix}-python'
+      Description: !Sub 'Python build project for ${ProjectPrefix}'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      EncryptionKey: !GetAtt BuildEncryptionKey.Arn
+      Artifacts:
+        Type: S3
+        Location: !Sub '${ArtifactsBucket}/python-builds'
+        Name: !Sub '${ProjectPrefix}-python-artifacts'
+        OverrideArtifactName: true
+        Packaging: ZIP
+      Cache:
+        Type: S3
+        Location: !Sub '${CacheBucket}/python-cache'
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:4.0
+      Source:
+        Type: CODECOMMIT
+        BuildSpec: |
+          version: 0.2
+          
+          phases:
+            install:
+              runtime-versions:
+                python: 3.9
+              commands:
+                - echo "Installing Python dependencies"
+                - pip install --upgrade pip setuptools wheel
+                - pip install -r requirements.txt
+                - pip install pytest pytest-cov bandit safety
+                
+            pre_build:
+              commands:
+                - echo "Running pre-build checks"
+                - pylint src/ --exit-zero
+                - bandit -r src/ -f json -o security-report.json
+                - safety check --json --output safety-report.json
+                - pytest tests/unit/ --cov=src --cov-report=xml
+                
+            build:
+              commands:
+                - echo "Building Python application"
+                - python setup.py bdist_wheel
+                - pip install dist/*.whl
+                
+            post_build:
+              commands:
+                - echo "Running integration tests"
+                - pytest tests/integration/
+                
+          artifacts:
+            files:
+              - 'dist/**/*'
+              - 'requirements.txt'
+              - 'setup.py'
+            name: python-build-$CODEBUILD_BUILD_NUMBER
+            
+          cache:
+            paths:
+              - ~/.cache/pip/**/*
+              
+          reports:
+            unit-tests:
+              files:
+                - 'coverage.xml'
+              file-format: COBERTURAXML
+              
+      TimeoutInMinutes: 60
+      Tags:
+        - Key: Name
+          Value: !Sub '${OrganizationName}-${ProjectPrefix}-python'
+        - Key: Organization
+          Value: !Ref OrganizationName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ApplicationType
+          Value: python
+
+  # CloudWatch Alarms
+  BuildFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${OrganizationName}-CodeBuild-HighFailureRate'
+      AlarmDescription: 'Alert when CodeBuild failure rate is high'
+      MetricName: FailedBuilds
+      Namespace: AWS/CodeBuild
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref BuildNotificationsTopic
+      Dimensions:
+        - Name: ProjectName
+          Value: !Ref NodeJSBuildProject
+
+  BuildDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${OrganizationName}-CodeBuild-LongBuildDuration'
+      AlarmDescription: 'Alert when build duration exceeds threshold'
+      MetricName: Duration
+      Namespace: AWS/CodeBuild
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 30
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref BuildNotificationsTopic
+      Dimensions:
+        - Name: ProjectName
+          Value: !Ref NodeJSBuildProject
+
+  # EventBridge Rule for Build State Changes
+  BuildStateChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${OrganizationName}-codebuild-state-changes'
+      Description: 'Capture CodeBuild state changes'
+      EventPattern:
+        source:
+          - aws.codebuild
+        detail-type:
+          - CodeBuild Build State Change
+        detail:
+          project-name:
+            - !Ref NodeJSBuildProject
+            - !Ref DockerBuildProject
+            - !Ref PythonBuildProject
+          build-status:
+            - FAILED
+            - SUCCEEDED
+            - STOPPED
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt BuildStateChangeFunction.Arn
+          Id: BuildStateChangeLambdaTarget
+
+  # Lambda Function for Build State Changes
+  BuildStateChangeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${OrganizationName}-codebuild-state-handler'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Timeout: 60
+      Role: !GetAtt BuildStateChangeFunctionRole.Arn
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref BuildNotificationsTopic
+          ORGANIZATION_NAME: !Ref OrganizationName
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          from datetime import datetime
+          
+          sns = boto3.client('sns')
+          cloudwatch = boto3.client('cloudwatch')
+          
+          def lambda_handler(event, context):
+              try:
+                  detail = event['detail']
+                  project_name = detail['project-name']
+                  build_status = detail['build-status']
+                  build_id = detail['build-id']
+                  
+                  # Send custom metrics
+                  metric_value = 1 if build_status == 'SUCCEEDED' else 0
+                  cloudwatch.put_metric_data(
+                      Namespace='CodeBuild/CustomMetrics',
+                      MetricData=[
+                          {
+                              'MetricName': 'BuildSuccess',
+                              'Dimensions': [
+                                  {'Name': 'ProjectName', 'Value': project_name}
+                              ],
+                              'Value': metric_value,
+                              'Unit': 'Count',
+                              'Timestamp': datetime.utcnow()
+                          }
+                      ]
+                  )
+                  
+                  # Send detailed notification for failures
+                  if build_status == 'FAILED':
+                      message = f"""
+          CodeBuild Project: {project_name}
+          Build ID: {build_id}
+          Status: {build_status}
+          Time: {detail.get('build-start-time', 'Unknown')}
+          
+          Please check the build logs for details:
+          https://console.aws.amazon.com/codesuite/codebuild/projects/{project_name}/history
+                      """
+                      
+                      sns.publish(
+                          TopicArn=os.getenv('SNS_TOPIC_ARN'),
+                          Subject=f'CodeBuild FAILED: {project_name}',
+                          Message=message
+                      )
+                  
+                  return {'statusCode': 200}
+                  
+              except Exception as e:
+                  print(f'Error processing build state change: {str(e)}')
+                  return {'statusCode': 500}
+
+  BuildStateChangeFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BuildStateChangePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref BuildNotificationsTopic
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+
+  # Lambda Permission for EventBridge
+  BuildStateChangeFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BuildStateChangeFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt BuildStateChangeRule.Arn
+
+Outputs:
+  NodeJSProjectName:
+    Description: Name of the Node.js CodeBuild project
+    Value: !Ref NodeJSBuildProject
+    Export:
+      Name: !Sub '${AWS::StackName}-NodeJSProject'
+
+  DockerProjectName:
+    Description: Name of the Docker CodeBuild project
+    Value: !Ref DockerBuildProject
+    Export:
+      Name: !Sub '${AWS::StackName}-DockerProject'
+
+  PythonProjectName:
+    Description: Name of the Python CodeBuild project
+    Value: !Ref PythonBuildProject
+    Export:
+      Name: !Sub '${AWS::StackName}-PythonProject'
+
+  ArtifactsBucket:
+    Description: S3 bucket for build artifacts
+    Value: !Ref ArtifactsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ArtifactsBucket'
+
+  CacheBucket:
+    Description: S3 bucket for build cache
+    Value: !Ref CacheBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-CacheBucket'
+
+  ServiceRoleArn:
+    Description: ARN of the CodeBuild service role
+    Value: !GetAtt CodeBuildServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceRole'
+
+  BatchServiceRoleArn:
+    Description: ARN of the CodeBuild batch service role
+    Value: !GetAtt CodeBuildBatchServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BatchServiceRole'
+
+  NotificationTopicArn:
+    Description: ARN of the build notifications topic
+    Value: !Ref BuildNotificationsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopic'
+
+  EncryptionKeyArn:
+    Description: ARN of the KMS encryption key
+    Value: !GetAtt BuildEncryptionKey.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EncryptionKey'
